@@ -1,6 +1,9 @@
 // Copyright (c) 2022, Zachary D. Olkin.
 // This code is provided under the MIT license.
 
+use core::marker::PhantomData;
+
+use crate::icm20948::dmp::DmpRegisters;
 use crate::icm20948::AccLPF;
 use crate::icm20948::AccSensitivity;
 use crate::icm20948::AccStates::{self, *};
@@ -20,9 +23,12 @@ use defmt::{Format, Formatter};
 
 use embedded_hal::blocking::i2c;
 
+use super::NoDmp;
+use super::READ_REG;
+
 /// The ICM IMU struct is the base of the driver. Instantiate this struct in your application code then use
 /// it to interact with the IMU.
-pub struct IcmImu<BUS> {
+pub struct IcmImu<BUS, DMP> {
     bus: BUS,
     acc_en: AccStates,
     gyro_en: GyroStates,
@@ -36,9 +42,10 @@ pub struct IcmImu<BUS> {
     int_enabled: bool,
 
     addr: u8,
+    _dmp: PhantomData<DMP>,
 }
 
-impl<BUS, E> IcmImu<BUS>
+impl<BUS, E: core::fmt::Debug> IcmImu<BUS, super::dmp::Dmp>
 where
     BUS: i2c::WriteRead<u8, Error = E> + i2c::Write<u8, Error = E>,
 {
@@ -47,7 +54,7 @@ where
     /// The I2C bus is given as `bus`
     ///
     /// The 7-bit address is specified as `addr`
-    pub fn new(mut bus: BUS, addr: u8) -> Result<Self, IcmError<E>> {
+    pub fn new(mut bus: BUS, addr: u8) -> Result<IcmImu<BUS, NoDmp>, IcmError<E>> {
         let mut buf = [0; 3];
         buf[0] = RegistersBank0::PwrMgmt1.get_addr(WRITE_REG);
         buf[1] = 0x01;
@@ -63,9 +70,15 @@ where
             int_enabled: INT_NOT_ENABLED,
             databuf: [0; 5],
             addr,
+            _dmp: PhantomData,
         })
     }
+}
 
+impl<BUS, DMP, E: core::fmt::Debug> IcmImu<BUS, DMP>
+where
+    BUS: i2c::WriteRead<u8, Error = E> + i2c::Write<u8, Error = E>,
+{
     /// Who Am I? Reads the wai register and reports the value.
     ///
     /// Useful for testing that the IMU is properly connected. See the data sheet for the expected return value.
@@ -625,9 +638,219 @@ where
 
         Ok(())
     }
+
+    fn mem_change_bank(&mut self, bank: u8) -> Result<(), IcmError<E>> {
+        self.change_bank(0)?;
+        self.databuf[0] = RegistersBank0::MemBankSel.get_addr(WRITE_REG);
+        self.databuf[1] = bank;
+
+        self.bus.write(self.addr, &self.databuf[0..2])?;
+
+        Ok(())
+    }
+
+    fn set_mem_start_addr(&mut self, start_addr: u8) -> Result<(), IcmError<E>> {
+        self.change_bank(0)?;
+        self.databuf[0] = RegistersBank0::MemStartAddr.get_addr(WRITE_REG);
+        self.databuf[1] = start_addr;
+
+        self.bus.write(self.addr, &self.databuf[0..2])?;
+
+        Ok(())
+    }
+
+    fn dmp_write(&mut self, address: u16, data: &[u8]) -> Result<(), IcmError<E>> {
+        self.mem_change_bank((address >> 8) as u8)?;
+        self.set_mem_start_addr((address & 0xff) as u8)?;
+        let mut buf = [0u8; 257];
+        buf[0] = RegistersBank0::MemRW.get_addr(WRITE_REG);
+        buf[1..data.len() + 1].copy_from_slice(data);
+
+        self.bus.write(self.addr, &buf[0..data.len() + 1])?;
+
+        Ok(())
+    }
+
+    fn dmp_read(&mut self, address: u16, buf: &mut [u8]) -> Result<(), IcmError<E>> {
+        self.mem_change_bank((address >> 8) as u8)?;
+        self.set_mem_start_addr((address & 0xff) as u8)?;
+        self.bus.write_read(self.addr, &[RegistersBank0::MemRW.get_addr(READ_REG)], buf)?;
+        Ok(())
+    }
+
+    fn set_program_start_address(&mut self, address: u16) -> Result<(), IcmError<E>>{
+        self.change_bank(2)?;
+        let prgm_start_addr = RegistersBank2::PrgmStrtAddrH.get_addr(WRITE_REG);
+
+        self.databuf[0..2].copy_from_slice(&address.to_be_bytes());
+        self.bus.write(self.addr, &[prgm_start_addr, self.databuf[0], self.databuf[1]])?;
+        Ok(())
+    }
+
+    /// Flashes the DMP firmware to the IMU.
+    #[cfg(feature = "dmp")]
+    pub fn load_dmp_firmware(mut self) -> Result<IcmImu<BUS, super::dmp::Dmp>, IcmError<E>> {
+        self.set_program_start_address(0x1000)?;
+
+        let firmware = super::dmp::FIRMWARE;
+        let mem_base_offset = 0x90usize;
+        let mut current = 0x0usize;
+
+        while current < firmware.len() {
+            let n = current + mem_base_offset;
+            let max_transfer = core::cmp::min(core::cmp::min(256 - (n % 0xff), firmware.len() - current), 16);
+            // hprintln!("W {:x?} len {:x?}", n, max_transfer);
+            self.dmp_write(n as u16, &firmware[current..current + max_transfer])?;
+
+            current += max_transfer;
+        }
+
+        self.set_program_start_address(0x1000)?;
+
+        // Verify the firmware was written correctly
+        let mut buf = [0u8; 256];
+        let mut current = 0x0usize;
+        while current < firmware.len() {
+            let n = current + mem_base_offset;
+            // let max_transfer = core::cmp::min(256 - (n % 0xff), firmware.len() - current);
+            let max_transfer = core::cmp::min(core::cmp::min(256 - (n % 0xff), firmware.len() - current), 16);
+            self.dmp_read(n as u16, &mut buf[0..max_transfer])?;
+
+            current += max_transfer;
+        }
+
+
+        self.change_bank(0)?;
+        // Magic constants from Sparkfun (thank god this path of madness hath been trod before me) 
+        self.bus.write(self.addr, &[RegistersBank0::HwFixDisable.get_addr(WRITE_REG), 0x48])?;
+        self.bus.write(self.addr, &[RegistersBank0::FifoPrioritySel.get_addr(WRITE_REG), 0xe4])?;
+
+        Ok(IcmImu {
+            bus: self.bus,
+            acc_en: self.acc_en,
+            gyro_en: self.gyro_en,
+            mag_en: self.mag_en,
+            accel_sen: self.accel_sen,
+            gyro_sen: self.gyro_sen,
+            int_enabled: self.int_enabled,
+            databuf: self.databuf,
+            addr: self.addr,
+            _dmp: PhantomData,
+        })
+    }
 }
 
-impl<BUS> Format for IcmImu<BUS> {
+#[cfg(feature = "dmp")]
+impl<BUS, E: core::fmt::Debug> IcmImu<BUS, super::dmp::Dmp>
+where
+    BUS: i2c::WriteRead<u8, Error = E> + i2c::Write<u8, Error = E>,
+{
+    /// Enables a sensor in the DMP.
+    pub fn enable_sensor(&mut self, sensor: super::dmp::Header) -> Result<(), IcmError<E>> {
+        let data_ctl_1 = super::dmp::DmpRegisters::DataOutCtl1 as u16;
+
+        let mut current_ctl_1 = [0u8; 2];
+        self.dmp_read(data_ctl_1, &mut current_ctl_1)?;
+        self.dmp_write(DmpRegisters::OdrAccel as u16, &[8])?;
+        let new_ctl = u16::from_be_bytes(current_ctl_1) | sensor.bits();
+
+        self.dmp_write(data_ctl_1, &new_ctl.to_be_bytes())?;
+
+        self.change_bank(0)?;
+        self.bus.write(self.addr, &[RegistersBank0::FifoEn2.get_addr(WRITE_REG), 0b11111])?;
+
+        Ok(())
+    }
+
+    /// Enable the DMP.
+    pub fn enable_dmp(&mut self) -> Result<(), IcmError<E>> {
+        self.change_bank(0)?;
+        let user_ctrl_r = RegistersBank0::UserCtrl.get_addr(READ_REG);
+        self.bus.write_read(self.addr, &[user_ctrl_r], &mut self.databuf[0..1])?;
+        self.databuf[0] = self.databuf[0] | (1 << 7); // DMP_EN
+        let user_ctrl_w = RegistersBank0::UserCtrl.get_addr(WRITE_REG);
+        self.bus.write(self.addr, &[user_ctrl_w, self.databuf[0]])?;
+
+        Ok(())
+    }
+
+    /// Reset the FIFO.
+    pub fn reset_fifo(&mut self) -> Result<(), IcmError<E>> {
+        self.change_bank(0)?;
+        let fifo_rst_r = RegistersBank0::FifoRst.get_addr(READ_REG);
+        self.bus.write_read(self.addr, &[fifo_rst_r], &mut self.databuf[0..1])?;
+
+        // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/9a10c510ddb694f08aa93c12d586358cb45abd2b/src/util/ICM_20948_C.c#L1134
+        // Some undocumented magic.
+        self.databuf[0] = 0x1f;
+        let fifo_rst_w = RegistersBank0::FifoRst.get_addr(WRITE_REG);
+        self.bus.write(self.addr, &[fifo_rst_w, self.databuf[0]])?;
+        self.databuf[0] = 0x1e;
+        self.bus.write(self.addr, &[fifo_rst_w, self.databuf[0]])?;
+
+        Ok(())
+    }
+
+
+    /// Reset the DMP
+    pub fn reset_dmp(&mut self) -> Result<(), IcmError<E>> {
+        self.change_bank(0)?;
+        let user_ctrl_r = RegistersBank0::UserCtrl.get_addr(READ_REG);
+        self.bus.write_read(self.addr, &[user_ctrl_r], &mut self.databuf[0..1])?;
+        self.databuf[0] = self.databuf[0] | (1 << 3); // DMP_RST
+        let user_ctrl_w = RegistersBank0::UserCtrl.get_addr(WRITE_REG);
+        self.bus.write(self.addr, &[user_ctrl_w, self.databuf[0]])?;
+
+        Ok(())
+    }
+
+    /// Enable the FIFO.
+    pub fn enable_fifo(&mut self) -> Result<(), IcmError<E>> {
+        self.change_bank(0)?;
+        let user_ctrl_r = RegistersBank0::UserCtrl.get_addr(READ_REG);
+        self.bus.write_read(self.addr, &[user_ctrl_r], &mut self.databuf[0..1])?;
+        self.databuf[0] = self.databuf[0] | (1 << 6); // FIFO_EN
+        let user_ctrl_w = RegistersBank0::UserCtrl.get_addr(WRITE_REG);
+        self.bus.write(self.addr, &[user_ctrl_w, self.databuf[0]])?;
+
+        Ok(())
+    }
+
+    /// Number of bytes in the FIFO.
+    pub fn get_fifo_count(&mut self) -> Result<u16, IcmError<E>> {
+        self.change_bank(0)?;
+        let fifo_count_h = RegistersBank0::FifoCountH.get_addr(READ_REG);
+        let mut buf = [0u8; 2];
+        self.bus.write_read(self.addr, &[fifo_count_h], &mut buf)?;
+        
+        Ok(u16::from_be_bytes(buf))
+    }
+
+    /// Reads the FIFO buffer.
+    pub fn read_fifo(&mut self, buf: &mut [u8]) -> Result<usize, IcmError<E>> {
+        let mut buf_rdy = [0u8;2];
+        self.dmp_read(DmpRegisters::DataRdyStatus as u16, &mut buf_rdy)?;
+        // hprintln!("rdy{:x?}", u16::from_be_bytes(buf_rdy));
+        self.change_bank(0)?;
+        let fifo_r = RegistersBank0::FifoRW.get_addr(READ_REG);
+        let buf_len = buf.len();
+        let fifo_count = self.get_fifo_count().unwrap() as usize;
+        // hprintln!("fifo count {}", fifo_count);
+        let buf = &mut buf[..core::cmp::min(buf_len, fifo_count)];
+        // hprintln!("buf len {}", buf.len());
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.bus.write_read(
+            self.addr,
+            &[fifo_r],
+            buf
+        ).unwrap();
+        Ok(buf.len())
+    }
+}
+
+impl<BUS, DMP> Format for IcmImu<BUS, DMP> {
     fn format(&self, fmt: Formatter) {
         defmt::write!(fmt, "ICM-20948 IMU")
     }

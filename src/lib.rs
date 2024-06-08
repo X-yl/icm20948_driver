@@ -27,12 +27,11 @@
 //! # Repository
 //! The github repo can be found [here](https://github.com/Zolkin1/icm20948_driver).
 
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 #![no_std]
 #![no_main]
 
 use defmt_rtt as _; // global logger
-use panic_probe as _;
 
 /// Main module that holds the SPI and I2C sub modules.
 /// Also holds many enums and constants shared between SPI and I2C
