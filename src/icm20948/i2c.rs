@@ -21,7 +21,7 @@ use crate::icm20948::{
 use crate::icm20948::{REG_BANK_0, REG_BANK_2};
 use defmt::{Format, Formatter};
 
-use embedded_hal::blocking::i2c;
+use embedded_hal::i2c;
 
 use super::NoDmp;
 use super::READ_REG;
@@ -47,7 +47,7 @@ pub struct IcmImu<BUS, DMP> {
 
 impl<BUS, E: core::fmt::Debug> IcmImu<BUS, super::dmp::Dmp>
 where
-    BUS: i2c::WriteRead<u8, Error = E> + i2c::Write<u8, Error = E>,
+    BUS: i2c::I2c<Error = E>,
 {
     /// Create and initialize a new IMU driver.
     ///
@@ -77,7 +77,7 @@ where
 
 impl<BUS, DMP, E: core::fmt::Debug> IcmImu<BUS, DMP>
 where
-    BUS: i2c::WriteRead<u8, Error = E> + i2c::Write<u8, Error = E>,
+    BUS: i2c::I2c<Error = E>,
 {
     /// Who Am I? Reads the wai register and reports the value.
     ///
@@ -743,7 +743,7 @@ where
 #[cfg(feature = "dmp")]
 impl<BUS, E: core::fmt::Debug> IcmImu<BUS, super::dmp::Dmp>
 where
-    BUS: i2c::WriteRead<u8, Error = E> + i2c::Write<u8, Error = E>,
+    BUS: i2c::I2c<Error = E>,
 {
     /// Enables a sensor in the DMP.
     pub fn enable_sensor(&mut self, sensor: super::dmp::Header) -> Result<(), IcmError<E>> {
